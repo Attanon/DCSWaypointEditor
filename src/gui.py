@@ -1,9 +1,11 @@
+import mss as mss
+
 from src.objects import Profile, Waypoint, MSN, load_base_file, generate_default_bases
 from src.first_setup import first_time_setup, detect_the_way
 from src.logger import get_logger
 from peewee import DoesNotExist
 from LatLon23 import LatLon, Longitude, Latitude, string2latlon
-from PIL import ImageGrab, ImageEnhance, ImageOps
+from PIL import ImageGrab, ImageEnhance, ImageOps, Image
 from pathlib import Path
 import pytesseract
 import keyboard
@@ -500,24 +502,122 @@ class GUI:
 
         return True
 
-    def capture_map_coords(self, x_start=101, x_width=269, y_start=5, y_height=27):
-        self.logger.debug("Attempting to capture map coords")
+    def capture_unit_coords(self, displayImages, debug_dirname):
+        self.logger.debug("UNIT: Attempting to capture unit coords")
         gui_mult = 2 if self.scaled_dcs_gui else 1
 
-        dt = datetime.datetime.now()
-        debug_dirname = dt.strftime("%Y-%m-%d-%H-%M-%S")
+        debug_dirname = debug_dirname + "/unit"
 
         if self.save_debug_images == "true":
             os.mkdir(debug_dirname)
 
+        map_image = cv2.imread("data/alt.png")
+        arrow_image = cv2.imread("data/callsign.png")
+        for display_number, image in enumerate(displayImages):
+            self.logger.debug("UNIT: Looking for map on screen " + str(display_number))
+
+            screen_image = cv2.cvtColor(numpy.array(image), cv2.COLOR_RGB2BGR)  # convert it to OpenCV format
+
+            search_result = cv2.matchTemplate(screen_image, map_image, cv2.TM_CCOEFF_NORMED)  # search for the "ALT" text in the screenshot
+            # matchTemplate returns a new greyscale image where the brightness of each pixel corresponds to how good a match there was at that point
+            # so now we search for the 'whitest' pixel
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(search_result)
+            self.logger.debug("UNIT: Minval: " + str(min_val) + " Maxval: " + str(max_val) + " Minloc: " + str(min_loc) + " Maxloc: " + str(max_loc))
+            start_x = max_loc[0] + map_image.shape[0]
+            start_y = max_loc[1]
+
+            if max_val > 0.9:  # better than a 90% match means we are on to something
+
+                search_result = cv2.matchTemplate(screen_image, arrow_image, cv2.TM_CCOEFF_NORMED)  # now we search for the arrow icon
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(search_result)
+                self.logger.debug("UNIT: Minval: " + str(min_val) + " Maxval: " + str(max_val) + " Minloc: " + str(min_loc) + " Maxloc: " + str(max_loc))
+
+                end_x = max_loc[0]
+                end_y = max_loc[1] + map_image.shape[1]
+
+                self.logger.debug("UNIT: Capturing " + str(start_x) + "x" + str(start_y) + " to " + str(end_x) + "x" + str(end_y) )
+
+                lat_lon_image = image.crop([start_x - 30, start_y + 80, end_x, end_y - 40])
+                lat_lon_image = lat_lon_image.convert("L")
+                alt_image = image.crop([start_x, start_y, end_x, end_y - 120])
+                alt_image = alt_image.convert("L")
+
+                if self.save_debug_images == "true":
+                    lat_lon_image.save(debug_dirname + "/lat_lon_image.png")
+
+                if self.save_debug_images == "true":
+                    alt_image.save(debug_dirname + "/alt_image.png")
+
+                lat_lon_resized = lat_lon_image.resize((lat_lon_image.width + 250, lat_lon_image.height + 50))
+                if self.save_debug_images == "true":
+                    lat_lon_resized.save(debug_dirname + "/lat_lon_resized.png")
+
+                alt_image_resized = alt_image.resize((alt_image.width + 250, alt_image.height + 50))
+                if self.save_debug_images == "true":
+                    alt_image_resized.save(debug_dirname + "/alt_image_resized.png")
+
+                inverted = ImageOps.invert(lat_lon_resized)
+                if self.save_debug_images == "true":
+                    inverted.save(debug_dirname + "/lat_lon_image_inverted.png")
+
+                invertedAlt = ImageOps.invert(alt_image_resized)
+                if self.save_debug_images == "true":
+                    invertedAlt.save(debug_dirname + "/invertedAlt.png")
+
+                captured_map_coords = str(pytesseract.image_to_string(inverted))
+                self.logger.debug("UNIT: Raw captured text: " + captured_map_coords)
+                captured_alt_coords = str(pytesseract.image_to_string(invertedAlt))
+                self.logger.debug("UNIT: Raw captured alt text: " + captured_alt_coords)
+
+                if captured_alt_coords == "":
+                    self.logger.debug("UNIT: Empty alt, setting 0")
+                    captured_alt_coords = "0"
+
+                if captured_alt_coords != "":
+                    captured_map_coords = captured_map_coords.replace("\n", "").replace("(", "").replace("'", " ").replace(",", "") + ", " + captured_alt_coords.replace("\n", "") + " ft"
+
+                self.logger.debug("UNIT: Raw captured full coords: " + captured_map_coords)
+                return captured_map_coords
+
+        self.logger.debug("UNIT: Raise exception (could not find the map anywhere i guess)")
+
+        raise ValueError("UNIT: F10 map not found")
+
+    def capture_map_coords(self, x_start=101, x_width=269, y_start=5, y_height=27):
+        dt = datetime.datetime.now()
+        debug_dirname = "debug_images/" + dt.strftime("%Y-%m-%d-%H-%M-%S")
+
+        if self.save_debug_images == "true":
+            os.makedirs(debug_dirname, exist_ok=True)
+
+        displayImages = list()
+        with mss.mss() as sct:
+            # Get rid of the first, as it represents the "All in One" monitor:
+            for num, monitor in enumerate(sct.monitors[1:], 1):
+                # Get raw pixels from the screen
+                sct_img = sct.grab(monitor)
+
+                # Create the Image
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                if self.save_debug_images == "true":
+                    img.save(debug_dirname + "/screenshot-" + str(num) + ".png")
+
+                displayImages.append(img)
+
+        try:
+            coords = self.capture_unit_coords(displayImages, debug_dirname)
+            return coords
+        except ValueError:
+            pass
+
+        self.logger.debug("Attempting to capture map coords")
+        gui_mult = 2 if self.scaled_dcs_gui else 1
+
         map_image = cv2.imread("data/map.bin")
         arrow_image = cv2.imread("data/arrow.bin")
 
-        for display_number, image in enumerate(getDisplaysAsImages(), 1):
+        for display_number, image in enumerate(displayImages):
             self.logger.debug("Looking for map on screen " + str(display_number))
-
-            if self.save_debug_images == "true":
-                image.save(debug_dirname + "/screenshot-"+str(display_number)+".png")
 
             screen_image = cv2.cvtColor(numpy.array(image), cv2.COLOR_RGB2BGR)  # convert it to OpenCV format
 
